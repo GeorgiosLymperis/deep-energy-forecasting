@@ -15,13 +15,19 @@ class MyFlow(nn.Module):
     def _build_flow(self):
         raise NotImplementedError
     
-    def log_prob(self, x, context):
+    def log_prob(self, x, context=None):
+        if context is None:
+            return self.flow().log_prob(x)
         return self.flow(context).log_prob(x)
     
-    def sample(self, n, context):
+    def sample(self, n, context=None):
+        if context is None:
+            return self.flow().sample((n,))
         return self.flow(context).sample((n,))
 
-    def forward(self, x, context):
+    def forward(self, x, context=None):
+        if context is None:
+            return self.flow().log_prob(x)
         return self.flow(context).log_prob(x)
     
     def save(self, path):
@@ -30,7 +36,7 @@ class MyFlow(nn.Module):
     def load(self, path):
         self.load_state_dict(torch.load(path))
 
-    def quantiles(self, context, q, n=100):
+    def quantiles(self, context=None, q=100, n=100):
         with torch.no_grad():
             y = self.sample(n, context)              # (n, B, D)
             y = y.detach().cpu().numpy()
@@ -150,8 +156,74 @@ class NormalizingFlowNAF(MyFlow):
                 
             )
 
-    
+class NormalizingFlowNSF(MyFlow):
+    """
+    Neural Spline Flow (NSF)
+    """
+    def __init__(self, features_dim, transforms, hidden_features):
+        self.features_dim = features_dim
+        self.transforms = transforms
+        self.hidden_features = hidden_features
+        super(NormalizingFlowNSF, self).__init__()
 
+    def _build_flow(self):
+        return zuko.flows.NSF(features=self.features_dim, transforms=self.transforms, hidden_features=self.hidden_features)
+
+    def fit(self, trainloader, validation_dataloader=None, epochs=50, lr=1e-3, patience=20):
+            # self.to(self.device)
+            optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+            best_val = float('inf')
+            best_state = None
+            bad_epochs = 0
+
+            for epoch in range(1, epochs + 1):
+                # --- Train ---
+                self.train()
+                train_losses = []
+                for _, y in trainloader:
+                    # x = x.to(self.device)
+                    y = y.to(self.device)
+                    optimizer.zero_grad()
+                    loss = -self.log_prob(y).mean()
+                    loss.backward()
+                    # torch.nn.utils.clip_grad_norm_(self.parameters(), 5.0)
+                    optimizer.step()
+                    train_losses.append(loss.detach().cpu().item())
+                train_error = float(np.mean(train_losses))
+
+                # --- Validation ---
+                if validation_dataloader is not None:
+                    self.eval()
+                    val_losses = []
+                    with torch.no_grad():
+                        for x_val, y_val in validation_dataloader:
+                            x_val = x_val.to(self.device)
+                            y_val = y_val.to(self.device)
+                            c_val = x_val.view(x_val.size(0), -1)
+                            val_loss = -self.log_prob(y_val, c_val).mean()
+                            val_losses.append(val_loss.detach().cpu().item())
+                    val_error = float(np.mean(val_losses))
+                    print(f"Epoch {epoch}: train error = {train_error:.4f} | val error = {val_error:.4f}")
+
+                    # scheduler & early stopping
+                    sched.step(val_error)
+                    if val_error < best_val - 1e-4:
+                        best_val = val_error
+                        best_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+                        bad_epochs = 0
+                    else:
+                        bad_epochs += 1
+                        if bad_epochs >= patience:
+                            print(f"Early stopping at epoch {epoch} (best val error = {best_val:.4f}).")
+                            break
+                else:
+                    print(f"Epoch {epoch}: train error = {train_error:.4f}")
+
+            if best_state is not None:
+                self.load_state_dict(best_state)
+            return self
 
 
 def evaluate_flow(flow, test_dataloader, model_label, **kwargs):
