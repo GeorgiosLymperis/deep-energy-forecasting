@@ -4,6 +4,7 @@ import os
 from torch.utils.data import Dataset, DataLoader
 import torch
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
 def get_device(use_gpu=False):
     if use_gpu and torch.cuda.is_available():
@@ -11,19 +12,47 @@ def get_device(use_gpu=False):
     else:
         return torch.device("cpu")
 
+def create_wind_dataset(folder='data/wind',save=False):
+        files = os.listdir(folder)
+        df_wind = pd.DataFrame()
+        for file in files:
+            df = pd.read_csv(os.path.join(folder, file), parse_dates=['TIMESTAMP'])
+            df_wind = pd.concat([df_wind, df], axis=0)
+        df_wind = pd.get_dummies(df_wind, prefix='ZONE', prefix_sep='_', columns=['ZONEID'], dtype='int')
+        if save:
+            df_wind.to_csv('data/wind_data.csv')
+        
+        return df_wind
 
-class GEFcom2014:
-    def __init__(self):
-        pass
+def create_solar_dataset(folder='data/solar', save=False):
+    inactive_hours = [i for i in range(9, 20 + 1)]
+    active_hours = [i for i in range(0, 24) if i not in inactive_hours]
+    files = os.listdir(folder)
+    df_solar = pd.DataFrame()
+    for file in files:
+        df = pd.read_csv(os.path.join(folder, file), parse_dates=['TIMESTAMP'], index_col='TIMESTAMP')
+        df_solar = pd.concat([df_solar, df], axis=0)
+    
+    df_solar['time'] = df_solar.index.hour
+    df_solar = df_solar[df_solar['time'].isin(active_hours)].drop(columns=['time'])
+    df_solar = pd.get_dummies(df_solar, prefix='ZONE', prefix_sep='_', columns=['ZONEID'], dtype='int')
+    if save:
+        df_solar.to_csv('data/solar_data.csv')
 
-    def build_features(self):
-        raise NotImplementedError
-    
-    def split(self):
-        raise NotImplementedError
-    
-    def load_data(self):
-        raise NotImplementedError
+    return df_solar.reset_index()
+
+def create_load_dataset(folder='data/load', save=False):
+    files = os.listdir(folder)
+    df_load = pd.DataFrame()
+    for file in files:
+        df = pd.read_csv(os.path.join(folder, file))
+        df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], format='%m%d%Y %H:%M')
+        df_load = pd.concat([df_load, df], axis=0)
+    df_load = df_load.drop(columns=['ZONEID']) # It has only one zone, so drop it
+    df_load = df_load.drop_duplicates()
+    if save:
+        df_load.to_csv('data/load_data.csv')
+    return df_load
     
 class MyDataset(Dataset):
     def __init__(self, data, labels):
@@ -37,26 +66,13 @@ class MyDataset(Dataset):
         return self.data[idx], self.labels[idx]
 
     
-class GEFcomWindLoader(GEFcom2014):
-    def __init__(self, folder='data/wind'):
-        self.folder = folder
-        self.create_dataset()
-        self.x_scaler = StandardScaler()
-        self.y_scaler = StandardScaler()
+class GEFcomWindLoader():
+    def __init__(self, dataframe, x_scaler=None, y_scaler=None):
+        self.dataframe = dataframe
+        self.x_scaler = x_scaler
+        self.y_scaler = y_scaler
 
-    def create_dataset(self, save=False):
-        files = os.listdir(self.folder)
-        df_wind = pd.DataFrame()
-        for file in files:
-            df = pd.read_csv(os.path.join(self.folder, file), parse_dates=['TIMESTAMP'], index_col='TIMESTAMP')
-            df_wind = pd.concat([df_wind, df], axis=0)
-        df_wind = pd.get_dummies(df_wind, prefix='ZONE', prefix_sep='_', columns=['ZONEID'], dtype='int')
-        if save:
-            df_wind.to_csv('data/wind_data.csv')
-        
-        self.dataframe = df_wind.copy()
-    
-    def build_features(self, density=1):
+    def __build_features(self, density=1, save=False):
         '''
         The predictors included wind forecasts at two heights, 10 and 100 m above ground level, obtained from the European Centre for Medium-range Weather Forecasts (ECMWF).
         These forecasts were for the zonal and meridional wind components (denoted u and v), i.e., projections of the wind vector on the west-east and south-north axes, respectively.
@@ -87,57 +103,104 @@ class GEFcomWindLoader(GEFcom2014):
         self.dataframe = self.dataframe.bfill()
 
         self.features = ['U10', 'V10', 'U100', 'V100', 'ws10', 'ws100', 'we10', 'we100', 'wd10', 'wd100']
-        self.zones = [i for i in range(1, 10 + 1)]
 
-    def split(self, random_state=42, test_size=0.2, validation_size=0.2):
-        X = self.dataframe.drop(columns=['TARGETVAR'])
-        y = self.dataframe['TARGETVAR']
+        if save:
+            self.dataframe.to_csv('data/wind_data_features.csv')
 
-        self.training_days = int((X.shape[0] * (1 - test_size)) // 24)
-        self.validation_days = int((self.training_days * validation_size) // 24)
-        self.test_days = int((X.shape[0] * test_size) // 24)
+    def create_dataset(self, shuffle=True):
+        self.__build_features()
+        zones = ['ZONE_' + str(i) for i in range(1, 10 + 1)]
+        col_names = []
+        target_names = ['TARGETVAR' + str(h) for h in range(1, 25)]
+        for col in self.features:
+            for h in range(1, 25):
+                col_names.append(col + '_' + str(h))
+        df = self.dataframe.copy()
+        nb_days = int(len(df) / 24)
+        index_1d = df['TIMESTAMP'].values.reshape(nb_days, 24)[:,0]
+        index = pd.DatetimeIndex(index_1d)
+        x = [df[col].values.reshape(nb_days, 24) for col in self.features]
+        x.extend([df[zone].values.reshape(nb_days, 24)[:, 0].reshape(nb_days, 1) for zone in zones]) # ZONEID is the same for all hours
+        col_names.extend(zones)
+        y = df['TARGETVAR'].values.reshape(nb_days, 24)
+        self.dataframe = pd.DataFrame(
+            np.concatenate([*x, y], axis=1), 
+            columns=col_names + target_names,
+            index=index
+            )
 
-        X_train = X.iloc[:(self.training_days * 24)]
-        X_validation = X.iloc[(self.training_days * 24):((self.training_days + self.validation_days) * 24)]
-        X_test = X.iloc[((self.training_days + self.validation_days) * 24):]
+        self.dataframe['month'] = self.dataframe.index.month
+        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
+        for zone in zones:
+            zone_indices = self.dataframe[zone] == 1
+            self.dataframe.loc[zone_indices, target_names] = self.dataframe.loc[zone_indices, target_names].shift(-1)
 
-        y_train = y.iloc[:(self.training_days * 24)]
-        y_validation = y.iloc[(self.training_days * 24):((self.training_days + self.validation_days) * 24)]
-        y_test = y.iloc[((self.training_days + self.validation_days) * 24):]
+        self.dataframe.dropna(inplace=True)
+        if shuffle:
+            self.dataframe = self.dataframe.sample(frac=1)
 
-        # Fit scaler on X
-        X_train_scaled = self.x_scaler.fit_transform(X_train)
+        return self.dataframe
+
+    def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
+        self.create_dataset(shuffle=shuffle)
+        X = self.dataframe.drop(columns=['TARGETVAR' + str(h) for h in range(1, 25)])
+        self.context_dim = len(X.columns)
+        y = self.dataframe[['TARGETVAR' + str(h) for h in range(1, 25)]]
+
+        if test_size > 0:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_train, X_test, y_train, y_test = X, [], y, []
+
+        if validation_size > 0 and len(X_test) > 0: 
+            X_test, X_val, y_test, y_val = train_test_split(X_train, y_train, test_size=validation_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_test, X_val, y_test, y_val = X_test, [], y_test, []
+
+
+        if self.x_scaler is None:
+            self.x_scaler = StandardScaler()
+            X_train_scaled = self.x_scaler.fit_transform(X_train)
+        else:
+            X_train_scaled = self.x_scaler.transform(X_train)
+
+        if self.y_scaler is None:
+            self.y_scaler = StandardScaler()
+            y_train_scaled = self.y_scaler.fit_transform(y_train)
+        else:
+            y_train_scaled = self.y_scaler.transform(y_train)
         
+        # Scale test
+        self.test_dataset = None
+        if len(X_test) > 0:
+            X_test_scaled = self.x_scaler.transform(X_test)
+            y_test_scaled = self.y_scaler.transform(y_test)
+            self.test_dataset = MyDataset(
+                    torch.tensor(X_test_scaled, dtype=torch.float32),
+                    torch.tensor(y_test_scaled, dtype=torch.float32)
+                )
 
-        # Scale validation and test
-        X_validation_scaled = self.x_scaler.transform(X_validation)
-        X_test_scaled = self.x_scaler.transform(X_test)
-        # Fit scaler on y
-        self.y_scaler = StandardScaler()
-        y_train_scaled = self.y_scaler.fit_transform(y_train.values.reshape(-1, 1)).flatten()
-        y_validation_scaled = self.y_scaler.transform(y_validation.values.reshape(-1, 1)).flatten()
-        y_test_scaled = self.y_scaler.transform(y_test.values.reshape(-1, 1)).flatten()
+        # Scale validation
+        self.validation_dataset = None
+        if len(X_val) > 0:
+            X_validation_scaled = self.x_scaler.transform(X_val)        
+            y_validation_scaled = self.y_scaler.transform(y_val)
+            self.validation_dataset = MyDataset(
+                    torch.tensor(X_validation_scaled, dtype=torch.float32),
+                    torch.tensor(y_validation_scaled, dtype=torch.float32)
+                )
+        
 
         # Make tensors
         self.train_dataset = MyDataset(
-            torch.tensor(X_train_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_train_scaled, dtype=torch.float32).view(-1, 24)
+            torch.tensor(X_train_scaled, dtype=torch.float32),
+            torch.tensor(y_train_scaled, dtype=torch.float32)
         )
-
-        self.validation_dataset = MyDataset(
-            torch.tensor(X_validation_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_validation_scaled, dtype=torch.float32).view(-1, 24)
-        )
-
-        self.test_dataset = MyDataset(
-            torch.tensor(X_test_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_test_scaled, dtype=torch.float32).view(-1, 24)
-        )
-
 
         return self.train_dataset, self.validation_dataset, self.test_dataset
 
-    def get_dataloaders(self, batch_size=32, shuffle=False, num_workers=4, use_gpu=False):
+    def get_dataloaders(self, batch_size=32, shuffle=True, num_workers=4, use_gpu=False, **kwargs):
+        self.split(shuffle=shuffle, **kwargs)
 
         device = get_device(use_gpu)
         pin = True if device.type == 'cuda' and use_gpu else False
@@ -145,40 +208,32 @@ class GEFcomWindLoader(GEFcom2014):
         self.train_dataloader = DataLoader(
             self.train_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.validation_dataloader = DataLoader(
-            self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+        if self.validation_dataset is not None:
+            self.validation_dataloader = DataLoader(
+                self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+            )
+        else:
+            self.validation_dataloader = None
+
+        if self.test_dataset is not None:
+            self.test_dataloader = DataLoader(
+                 self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.test_dataloader = DataLoader(
-            self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
-        )
+        else:
+            self.test_dataloader = None
 
         return self.train_dataloader, self.validation_dataloader, self.test_dataloader
 
-class GEFcomSolarLoader(GEFcom2014):
-    def __init__(self, folder='data/solar'):
-        self.folder = folder
+class GEFcomSolarLoader():
+    def __init__(self, dataframe, x_scaler=None, y_scaler=None):
+        self.dataframe = dataframe
         # from 9:00 to 20:00 we have zero power
         self.inactive_hours = [i for i in range(9, 20 + 1)]
         self.active_hours = [i for i in range(0, 24) if i not in self.inactive_hours]
-        self.create_dataset()
-        self.x_scaler = StandardScaler()
-        self.y_scaler = StandardScaler()
+        self.x_scaler = x_scaler
+        self.y_scaler = y_scaler
 
-    def create_dataset(self, save=False):
-        files = os.listdir(self.folder)
-        df_solar = pd.DataFrame()
-        for file in files:
-            df = pd.read_csv(os.path.join(self.folder, file), parse_dates=['TIMESTAMP'], index_col='TIMESTAMP')
-            df_solar = pd.concat([df_solar, df], axis=0)
-        
-        df_solar['time'] = df_solar.index.hour
-        df_solar = df_solar[df_solar['time'].isin(self.active_hours)].drop(columns=['time'])
-        df_solar = pd.get_dummies(df_solar, prefix='ZONE', prefix_sep='_', columns=['ZONEID'], dtype='int')
-        if save:
-            df_solar.to_csv('data/solar_data.csv')
-        self.dataframe = df_solar.copy()
-
-    def build_features(self):
+    def __build_features(self):
         '''
         The target variable is solar power.  There are 12 independent variables from the ECMWF NWP output to be used as below.
 
@@ -200,55 +255,102 @@ class GEFcomSolarLoader(GEFcom2014):
             'VAR78', 'VAR79', 'VAR134', 'VAR157', 'VAR164', 'VAR165',
             'VAR166', 'VAR167', 'VAR169', 'VAR175', 'VAR178', 'VAR228'
         ]
-        self.zones = [i for i in range(1, 3 + 1)]
 
-    def split(self, test_size=0.2, validation_size=0.2):
+    def create_dataset(self, shuffle=False):
+        self.__build_features()
+        zones = ['ZONE_' + str(i) for i in range(1, 3 + 1)]
+        col_names = []
+        target_names = ['POWER' + str(h) for h in self.active_hours]
+        for col in self.features:
+            for h in self.active_hours:
+                col_names.append(col + '_' + str(h))
+        df = self.dataframe.copy()
+        hours_per_day = len(self.active_hours)
+        nb_days = int(len(df) / hours_per_day)
+        index_1d = df['TIMESTAMP'].values.reshape(nb_days, hours_per_day)[:,0]
+        index = pd.DatetimeIndex(index_1d)
+        x = [df[col].values.reshape(nb_days, hours_per_day) for col in self.features]
+        x.extend([df[zone].values.reshape(nb_days, hours_per_day)[:, 0].reshape(nb_days, 1) for zone in zones]) # ZONEID is the same for all hours
+        col_names.extend(zones)
+        y = df['POWER'].values.reshape(nb_days, hours_per_day)
+        self.dataframe = pd.DataFrame(
+            np.concatenate([*x, y], axis=1), 
+            columns=col_names + target_names,
+            index=index
+            )
+
+        self.dataframe['month'] = self.dataframe.index.month
+        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
+        for zone in zones:
+            zone_indices = self.dataframe[zone] == 1
+            self.dataframe.loc[zone_indices, target_names] = self.dataframe.loc[zone_indices, target_names].shift(-1)
+
+        self.dataframe.dropna(inplace=True)
+        
+        if shuffle:
+            self.dataframe = self.dataframe.sample(frac=1)
+        return self.dataframe
+
+    def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
+        self.create_dataset(shuffle=shuffle)
         X = self.dataframe.drop(columns=['POWER'])
-        y = self.dataframe['POWER']
+        self.context_dim = len(X.columns)
+        y = self.dataframe[['POWER' + str(h) for h in self.active_hours]]
 
-        hours = len(self.active_hours)
-        self.training_days = int((X.shape[0] * (1 - test_size)) // hours)
-        self.validation_days = int(self.training_days * validation_size)
-        self.test_days = int(self.training_days * test_size)
+        if test_size > 0:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_train, X_test, y_train, y_test = X, [], y, []
+        
+        if validation_size > 0 and len(X_test) > 0: 
+            X_test, X_val, y_test, y_val = train_test_split(X_train, y_train, test_size=validation_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_test, X_val, y_test, y_val = X_test, [], y_test, []
 
-        X_train = X.iloc[:(self.training_days * hours)]
-        X_validation = X.iloc[(self.training_days * hours):((self.training_days + self.validation_days) * hours)]
-        X_test = X.iloc[((self.training_days + self.validation_days) * hours):]
 
-        y_train = y.iloc[:(self.training_days * hours)]
-        y_validation = y.iloc[(self.training_days * hours):((self.training_days + self.validation_days) * hours)]
-        y_test = y.iloc[((self.training_days + self.validation_days) * hours):]
+        if self.x_scaler is None:
+            self.x_scaler = StandardScaler()
+            X_train_scaled = self.x_scaler.fit_transform(X_train)
+        else:
+            X_train_scaled = self.x_scaler.transform(X_train)
 
-        # Fit scaler on X
-        X_train_scaled = self.x_scaler.fit_transform(X_train)
-        X_validation_scaled = self.x_scaler.transform(X_validation)
-        X_test_scaled = self.x_scaler.transform(X_test)
+        if self.y_scaler is None:
+            self.y_scaler = StandardScaler()
+            y_train_scaled = self.y_scaler.fit_transform(y_train)
+        else:
+            y_train_scaled = self.y_scaler.transform(y_train)
 
-        # Fit scaler on y
-        y_train_scaled = self.y_scaler.fit_transform(y_train.values.reshape(-1, 1)).flatten()
-        y_validation_scaled = self.y_scaler.transform(y_validation.values.reshape(-1, 1)).flatten()
-        y_test_scaled = self.y_scaler.transform(y_test.values.reshape(-1, 1)).flatten()
+        # Scale test
+        self.test_dataset = None
+        if len(X_test) > 0:
+            X_test_scaled = self.x_scaler.transform(X_test)
+            y_test_scaled = self.y_scaler.transform(y_test)
+            self.test_dataset = MyDataset(
+                    torch.tensor(X_test_scaled, dtype=torch.float32),
+                    torch.tensor(y_test_scaled, dtype=torch.float32)
+                )
+
+        # Scale validation
+        self.validation_dataset = None
+        if len(X_val) > 0:
+            X_validation_scaled = self.x_scaler.transform(X_val)        
+            y_validation_scaled = self.y_scaler.transform(y_val)
+            self.validation_dataset = MyDataset(
+                    torch.tensor(X_validation_scaled, dtype=torch.float32),
+                    torch.tensor(y_validation_scaled, dtype=torch.float32)
+                )
+        
 
         # Make tensors
         self.train_dataset = MyDataset(
-            torch.tensor(X_train_scaled, dtype=torch.float32).view(-1, hours, X.shape[1]),
-            torch.tensor(y_train_scaled, dtype=torch.float32).view(-1, hours)
+            torch.tensor(X_train_scaled, dtype=torch.float32),
+            torch.tensor(y_train_scaled, dtype=torch.float32)
         )
-
-        self.validation_dataset = MyDataset(
-            torch.tensor(X_validation_scaled, dtype=torch.float32).view(-1, hours, X.shape[1]),
-            torch.tensor(y_validation_scaled, dtype=torch.float32).view(-1, hours)
-        )
-
-        self.test_dataset = MyDataset(
-            torch.tensor(X_test_scaled, dtype=torch.float32).view(-1, hours, X.shape[1]),
-            torch.tensor(y_test_scaled, dtype=torch.float32).view(-1, hours)
-        )
-
 
         return self.train_dataset, self.validation_dataset, self.test_dataset
 
-    def get_dataloaders(self, batch_size=32, shuffle=False, num_workers=4, use_gpu=False):
+    def get_dataloaders(self, batch_size=32, shuffle=True, num_workers=4, use_gpu=False, **kwargs):
+        self.split(shuffle=shuffle, **kwargs)
 
         device = get_device(use_gpu)
         pin = True if device.type == 'cuda' and use_gpu else False
@@ -256,92 +358,122 @@ class GEFcomSolarLoader(GEFcom2014):
         self.train_dataloader = DataLoader(
             self.train_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.validation_dataloader = DataLoader(
-            self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+        if self.validation_dataset is not None:
+            self.validation_dataloader = DataLoader(
+                self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+            )
+        else:
+            self.validation_dataloader = None
+
+        if self.test_dataset is not None:
+            self.test_dataloader = DataLoader(
+                 self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.test_dataloader = DataLoader(
-            self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
-        )
+        else:
+            self.test_dataloader = None
 
         return self.train_dataloader, self.validation_dataloader, self.test_dataloader
     
 class GEFcomLoadLoader():
-    def __init__(self, folder='data/load'):
-        self.folder = folder
-        self.create_dataset()
-        self.x_scaler = StandardScaler()
-        self.y_scaler = StandardScaler()
+    def __init__(self, dataframe, x_scaler=None, y_scaler=None):
+        self.dataframe = dataframe
+        self.x_scaler = x_scaler
+        self.y_scaler = y_scaler
 
-
-    def create_dataset(self, save=False):
-        files = os.listdir(self.folder)
-        df_load = pd.DataFrame()
-        for file in files:
-            df = pd.read_csv(os.path.join(self.folder, file))
-            df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], format='%m%d%Y %H:%M')
-            df = df.set_index('TIMESTAMP')
-            df_load = pd.concat([df_load, df], axis=0)
-        df_load = df_load.drop(columns=['ZONEID'])
-        df_load = df_load.drop_duplicates()
-        if save:
-            df_load.to_csv('data/load_data.csv')
-        self.dataframe = df_load.iloc[23:].copy() # remove first day because is 23 hours
-
-    def build_features(self):
+    def __build_features(self):
         self.dataframe = self.dataframe.bfill()
         self.features = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8', 'w9', 'w10',
                 'w11', 'w12', 'w13', 'w14', 'w15', 'w16', 'w17', 'w18', 'w19', 'w20',
                 'w21', 'w22', 'w23', 'w24', 'w25']
         
-    def split(self, test_size=0.2, validation_size=0.2):
-        X = self.dataframe.drop(columns=['LOAD'])
-        y = self.dataframe['LOAD']
+    def create_dataset(self, shuffle=True):
+        self.__build_features()
+        col_names = []
+        target_names = ['LOAD' + str(h) for h in range(1, 25)]
+        for col in self.features:
+            for h in range(1, 25):
+                col_names.append(col + '_' + str(h))
+        df = self.dataframe.copy()
+        nb_days = int(len(df) / 24)
+        index_1d = df['TIMESTAMP'].values.reshape(nb_days, 24)[:,0]
+        index = pd.DatetimeIndex(index_1d)
+        x = [df[col].values.reshape(nb_days, 24) for col in self.features]
+        y = df['LOAD'].values.reshape(nb_days, 24)
+        self.dataframe = pd.DataFrame(
+            np.concatenate([*x, y], axis=1), 
+            columns=col_names + target_names,
+            index=index
+            )
 
-        self.training_days = int((X.shape[0] * (1 - test_size)) // 24)
-        self.validation_days = int((self.training_days * validation_size) // 24)
-        self.test_days = int((X.shape[0] * test_size) // 24)
+        self.dataframe['month'] = self.dataframe.index.month
+        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
 
-        X_train = X.iloc[:(self.training_days * 24)]
-        X_validation = X.iloc[(self.training_days * 24):((self.training_days + self.validation_days) * 24)]
-        X_test = X.iloc[((self.training_days + self.validation_days) * 24):]
+        self.dataframe.dropna(inplace=True)
+        if shuffle:
+            self.dataframe = self.dataframe.sample(frac=1)
 
-        y_train = y.iloc[:(self.training_days * 24)]
-        y_validation = y.iloc[(self.training_days * 24):((self.training_days + self.validation_days) * 24)]
-        y_test = y.iloc[((self.training_days + self.validation_days) * 24):]
+        return self.dataframe
+    
+    def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
+        self.create_dataset(shuffle=shuffle)
+        X = self.dataframe.drop(columns=['LOAD' + str(h) for h in range(1, 25)])
+        self.context_dim = len(X.columns)
+        y = self.dataframe[['LOAD' + str(h) for h in range(1, 25)]]
 
-        # Fit scaler on X
-        X_train_scaled = self.x_scaler.fit_transform(X_train)
+        if test_size > 0:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_train, X_test, y_train, y_test = X, [], y, []
+
+        if validation_size > 0 and len(X_test) > 0: 
+            X_test, X_val, y_test, y_val = train_test_split(X_train, y_train, test_size=validation_size, random_state=random_state, shuffle=shuffle)
+        else:
+            X_test, X_val, y_test, y_val = X_test, [], y_test, []
+
+
+        if self.x_scaler is None:
+            self.x_scaler = StandardScaler()
+            X_train_scaled = self.x_scaler.fit_transform(X_train)
+        else:
+            X_train_scaled = self.x_scaler.transform(X_train)
+
+        if self.y_scaler is None:
+            self.y_scaler = StandardScaler()
+            y_train_scaled = self.y_scaler.fit_transform(y_train)
+        else:
+            y_train_scaled = self.y_scaler.transform(y_train)
         
+        # Scale test
+        self.test_dataset = None
+        if len(X_test) > 0:
+            X_test_scaled = self.x_scaler.transform(X_test)
+            y_test_scaled = self.y_scaler.transform(y_test)
+            self.test_dataset = MyDataset(
+                    torch.tensor(X_test_scaled, dtype=torch.float32),
+                    torch.tensor(y_test_scaled, dtype=torch.float32)
+                )
 
-        # Scale validation and test
-        X_validation_scaled = self.x_scaler.transform(X_validation)
-        X_test_scaled = self.x_scaler.transform(X_test)
-        # Fit scaler on y
-        self.y_scaler = StandardScaler()
-        y_train_scaled = self.y_scaler.fit_transform(y_train.values.reshape(-1, 1)).flatten()
-        y_validation_scaled = self.y_scaler.transform(y_validation.values.reshape(-1, 1)).flatten()
-        y_test_scaled = self.y_scaler.transform(y_test.values.reshape(-1, 1)).flatten()
+        # Scale validation
+        self.validation_dataset = None
+        if len(X_val) > 0:
+            X_validation_scaled = self.x_scaler.transform(X_val)        
+            y_validation_scaled = self.y_scaler.transform(y_val)
+            self.validation_dataset = MyDataset(
+                    torch.tensor(X_validation_scaled, dtype=torch.float32),
+                    torch.tensor(y_validation_scaled, dtype=torch.float32)
+                )
+        
 
         # Make tensors
         self.train_dataset = MyDataset(
-            torch.tensor(X_train_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_train_scaled, dtype=torch.float32).view(-1, 24)
+            torch.tensor(X_train_scaled, dtype=torch.float32),
+            torch.tensor(y_train_scaled, dtype=torch.float32)
         )
-
-        self.validation_dataset = MyDataset(
-            torch.tensor(X_validation_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_validation_scaled, dtype=torch.float32).view(-1, 24)
-        )
-
-        self.test_dataset = MyDataset(
-            torch.tensor(X_test_scaled, dtype=torch.float32).view(-1, 24, X.shape[1]),
-            torch.tensor(y_test_scaled, dtype=torch.float32).view(-1, 24)
-        )
-
 
         return self.train_dataset, self.validation_dataset, self.test_dataset
 
-    def get_dataloaders(self, batch_size=32, shuffle=False, num_workers=4, use_gpu=False):
+    def get_dataloaders(self, batch_size=32, shuffle=True, num_workers=4, use_gpu=False, **kwargs):
+        self.split(shuffle=shuffle, **kwargs)
 
         device = get_device(use_gpu)
         pin = True if device.type == 'cuda' and use_gpu else False
@@ -349,19 +481,18 @@ class GEFcomLoadLoader():
         self.train_dataloader = DataLoader(
             self.train_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.validation_dataloader = DataLoader(
-            self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+        if self.validation_dataset is not None:
+            self.validation_dataloader = DataLoader(
+                self.validation_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
+            )
+        else:
+            self.validation_dataloader = None
+
+        if self.test_dataset is not None:
+            self.test_dataloader = DataLoader(
+                 self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
         )
-        self.test_dataloader = DataLoader(
-            self.test_dataset, batch_size=batch_size, shuffle=shuffle,num_workers=num_workers, pin_memory=pin
-        )
+        else:
+            self.test_dataloader = None
 
         return self.train_dataloader, self.validation_dataloader, self.test_dataloader
-        
-
-if __name__ == '__main__':
-    dataset = GEFcomLoadLoader()
-    dataset.create_dataset()
-    dataset.build_features()
-    dataset.split()
-    dataset.get_dataloaders()
