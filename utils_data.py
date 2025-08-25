@@ -123,29 +123,29 @@ class GEFcomWindLoader():
         x.extend([df[zone].values.reshape(nb_days, 24)[:, 0].reshape(nb_days, 1) for zone in zones]) # ZONEID is the same for all hours
         col_names.extend(zones)
         y = df['TARGETVAR'].values.reshape(nb_days, 24)
-        self.dataframe = pd.DataFrame(
+        df_per_day = pd.DataFrame(
             np.concatenate([*x, y], axis=1), 
             columns=col_names + target_names,
             index=index
             )
 
-        self.dataframe['month'] = self.dataframe.index.month
-        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
+        df_per_day['month'] = df_per_day.index.month
+        df_per_day['day_of_week'] = df_per_day.index.dayofweek
         for zone in zones:
-            zone_indices = self.dataframe[zone] == 1
-            self.dataframe.loc[zone_indices, target_names] = self.dataframe.loc[zone_indices, target_names].shift(-1)
+            zone_indices = df_per_day[zone] == 1
+            df_per_day.loc[zone_indices, target_names] = df_per_day.loc[zone_indices, target_names].shift(-1)
 
-        self.dataframe.dropna(inplace=True)
+        df_per_day.dropna(inplace=True)
         if shuffle:
-            self.dataframe = self.dataframe.sample(frac=1)
+            df_per_day = df_per_day.sample(frac=1)
 
-        return self.dataframe
+        return df_per_day
 
     def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
-        self.create_dataset(shuffle=shuffle)
-        X = self.dataframe.drop(columns=['TARGETVAR' + str(h) for h in range(1, 25)])
+        df_per_day = self.create_dataset(shuffle=shuffle)
+        X = df_per_day.drop(columns=['TARGETVAR' + str(h) for h in range(1, 25)])
         self.context_dim = len(X.columns)
-        y = self.dataframe[['TARGETVAR' + str(h) for h in range(1, 25)]]
+        y = df_per_day[['TARGETVAR' + str(h) for h in range(1, 25)]]
 
         if test_size > 0:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
@@ -273,29 +273,29 @@ class GEFcomSolarLoader():
         x.extend([df[zone].values.reshape(nb_days, hours_per_day)[:, 0].reshape(nb_days, 1) for zone in zones]) # ZONEID is the same for all hours
         col_names.extend(zones)
         y = df['POWER'].values.reshape(nb_days, hours_per_day)
-        self.dataframe = pd.DataFrame(
+        df_per_day = pd.DataFrame(
             np.concatenate([*x, y], axis=1), 
             columns=col_names + target_names,
             index=index
             )
 
-        self.dataframe['month'] = self.dataframe.index.month
-        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
+        df_per_day['month'] = df_per_day.index.month
+        df_per_day['day_of_week'] = df_per_day.index.dayofweek
         for zone in zones:
-            zone_indices = self.dataframe[zone] == 1
-            self.dataframe.loc[zone_indices, target_names] = self.dataframe.loc[zone_indices, target_names].shift(-1)
+            zone_indices = df_per_day[zone] == 1
+            df_per_day.loc[zone_indices, target_names] = df_per_day.loc[zone_indices, target_names].shift(-1)
 
-        self.dataframe.dropna(inplace=True)
+        df_per_day.dropna(inplace=True)
         
         if shuffle:
-            self.dataframe = self.dataframe.sample(frac=1)
-        return self.dataframe
+            self.dataframe = df_per_day.sample(frac=1)
+        return df_per_day
 
     def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
-        self.create_dataset(shuffle=shuffle)
-        X = self.dataframe.drop(columns=['POWER'])
+        df_per_day = self.create_dataset(shuffle=shuffle)
+        X = df_per_day.drop(columns=['POWER'])
         self.context_dim = len(X.columns)
-        y = self.dataframe[['POWER' + str(h) for h in self.active_hours]]
+        y = df_per_day[['POWER' + str(h) for h in self.active_hours]]
 
         if test_size > 0:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
@@ -399,26 +399,26 @@ class GEFcomLoadLoader():
         index = pd.DatetimeIndex(index_1d)
         x = [df[col].values.reshape(nb_days, 24) for col in self.features]
         y = df['LOAD'].values.reshape(nb_days, 24)
-        self.dataframe = pd.DataFrame(
+        df_per_day = pd.DataFrame(
             np.concatenate([*x, y], axis=1), 
             columns=col_names + target_names,
             index=index
             )
 
-        self.dataframe['month'] = self.dataframe.index.month
-        self.dataframe['day_of_week'] = self.dataframe.index.dayofweek
+        df_per_day['month'] = df_per_day.index.month
+        df_per_day['day_of_week'] = df_per_day.index.dayofweek
 
-        self.dataframe.dropna(inplace=True)
+        df_per_day.dropna(inplace=True)
         if shuffle:
-            self.dataframe = self.dataframe.sample(frac=1)
+            df_per_day = df_per_day.sample(frac=1)
 
-        return self.dataframe
+        return df_per_day
     
     def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
-        self.create_dataset(shuffle=shuffle)
-        X = self.dataframe.drop(columns=['LOAD' + str(h) for h in range(1, 25)])
+        df_per_day = self.create_dataset(shuffle=shuffle)
+        X = df_per_day.drop(columns=['LOAD' + str(h) for h in range(1, 25)])
         self.context_dim = len(X.columns)
-        y = self.dataframe[['LOAD' + str(h) for h in range(1, 25)]]
+        y = df_per_day[['LOAD' + str(h) for h in range(1, 25)]]
 
         if test_size > 0:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, shuffle=shuffle)
