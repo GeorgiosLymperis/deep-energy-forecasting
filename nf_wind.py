@@ -1,63 +1,94 @@
-from nf_utils import NormalizingFlowUMNN
-from utils_data import GEFcomWindLoader
+from nf_utils import (
+    UNAF, NAF, NSF,
+      plot_training, make_24h_forecast_with_bands, evaluate_flow
+            )
+from utils_data import GEFcomWindLoader, create_wind_dataset
 import torch
-from evaluation.metrics import crps_batch_per_marginal, energy_score_per_batch, variogram_score_per_batch, quantile_score_averaged_fast
+import numpy as np
+from tqdm import tqdm
 
-dataset = GEFcomWindLoader()
-dataset.build_features()
-dataset.split()
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
+    torch.cuda.init()
+    _ = torch.empty(1, device='cuda')  # pre-warm context
 
-train_dataloader, validation_dataloader, test_dataloader = dataset.get_dataloaders(batch_size=32)
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-flow = NormalizingFlowUMNN(x_dim=24, c_dim=480, hidden_features=[16, 16], signal=8)
+def plot_forecasts(flow, prediction_loader, save_path=None, **kwargs):
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import mean_absolute_error
+    dataset = prediction_loader.create_dataset(shuffle=False)
+    target_names = ['TARGETVAR' + str(h) for h in range(1, 25)]
+    zones = ['ZONE_' + str(i) for i in range(1, 10 + 1)]
+    samples = kwargs.get('samples', 100)
+    
+    fig, axes = plt.subplots(nrows=5, ncols=2, figsize=(12,14), sharex=True, sharey=True)
+    axes = axes.flatten()
 
-optimizer = torch.optim.Adam(flow.parameters(), lr=1e-3, weight_decay=1e-5)
+    pbar = tqdm(zones, desc="Predict Zones", leave=False)
+    for axe, zone in zip(axes, pbar):
+        df_zone = dataset[dataset[zone] == 1]
+        targets = df_zone[target_names].values.reshape(-1)
+        contexts = df_zone.drop(columns=target_names)
+        contexts_scaled = prediction_loader.x_scaler.transform(contexts)
+        c = torch.from_numpy(contexts_scaled).to(torch.float)
+        Q1, median, Q3 = make_24h_forecast_with_bands(flow, c, samples=samples)
+        Q1 = prediction_loader.y_scaler.inverse_transform(Q1).reshape(-1)
+        median = prediction_loader.y_scaler.inverse_transform(median).reshape(-1)
+        Q3 = prediction_loader.y_scaler.inverse_transform(Q3).reshape(-1)
 
+        mae = mean_absolute_error(targets, median)
+        axe.fill_between(np.arange(len(targets))/24, Q1, Q3, alpha=0.2)
+        axe.plot(np.arange(len(targets))/24, median, label='median')
+        axe.plot(np.arange(len(targets))/24, targets, label='targets')
+        axe.set_title(f"{zone} (MAE={mae:.2f})")
+        axe.legend()
+        axe.set_ylabel('Power')
+
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path)
+
+dataset = create_wind_dataset()
+train_dataset = dataset[dataset["TIMESTAMP"] < "2013-11-01 01:00:00"]
+prediction_dataset = dataset[dataset["TIMESTAMP"] >= "2013-11-01 01:00:00"]
+
+train_loader = GEFcomWindLoader(train_dataset.copy())
+
+train_dataloader, validation_dataloader, test_dataloader = train_loader.get_dataloaders(
+                                                                batch_size=32, shuffle=True, use_gpu=True, test_size=0.1, validation_size=0.5
+                                                                )
+
+prediction_loader = GEFcomWindLoader(prediction_dataset.copy(), x_scaler=train_loader.x_scaler, y_scaler=train_loader.y_scaler)
+
+prediction_dataloader, _, _ = prediction_loader.get_dataloaders(
+                                            batch_size=32, use_gpu=True, shuffle=False, 
+                                            test_size=0.0, validation_size=0.0
+                                            )
+c_dim = train_loader.context_dim
 epochs = 1
+lr = 1e-3
 
-for epoch in range(1, epochs + 1):
-    losses = []
+#______________ Training UNAF ________________
 
-    for x, label in train_dataloader:
-        # x_batch = label  # shape [batch_size, 24]
-        x_batch = torch.clamp(label, -10, 10)
-        c_batch = x.view(x.size(0), -1)  # flatten context per day: [batch_size, 480]
- 
-        loss = -flow.log_prob(x_batch, c_batch).mean()
-                
+flow = UNAF(x_dim=24, c_dim=c_dim, hidden_features=[16, 16], signal=8)
+history = flow.fit(train_dataloader, validation_dataloader=validation_dataloader, epochs=epochs, lr=lr, patience=20, device=device, save_path='models/UNAF_MODEL_WIND.pt')
+plot_training(history, title='Learning curve (UNAF)', save_path='plots/UNAF_LEARNING_CURVE_WIND.png')
+# evaluate_flow(flow, test_dataloader, 'UNAF_WIND', save_path='evaluations/NF_EVALUATION.json')
+plot_forecasts(flow, prediction_loader, save_path='plots/UNAF_FORECASTS_WIND.jpg')
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=0.5)
-        optimizer.step()
-        optimizer.zero_grad()
+#______________ Training NAF ________________
 
-        losses.append(loss.detach())
+flow = NAF(x_dim=24, c_dim=c_dim, hidden_features=[16, 16], signal=8)
+history = flow.fit(train_dataloader, validation_dataloader=validation_dataloader, epochs=epochs, lr=lr, patience=20, device=device, save_path='models/NAF_MODEL_WIND.pt')
+plot_training(history, title='Learning curve (NAF)', save_path='plots/NAF_LEARNING_CURVE_WIND.png')
+evaluate_flow(flow, test_dataloader, 'NAF_WIND', save_path='evaluations/NF_EVALUATION.json')
+plot_forecasts(flow, prediction_loader, save_path='plots/NAF_FORECASTS_WIND.jpg')
 
-    losses = torch.stack(losses)
-    print(f"Epoch {epoch}/{epochs}, NLL: {losses.mean():.4f}")
+#______________ Training NSF ________________
 
-with torch.no_grad():
-    for x, label in test_dataloader:
-        c_batch = x.view(x.size(0), -1)
-        x_batch = torch.clamp(label, -10, 10)
-        # quantiles = flow.quantiles(c_batch, [0.01*i for i in range(1, 100)])
-
-        samples = flow.sample(20, c_batch)
-        # print(samples.shape)
-        # print(x_batch.shape)
-        
-        samples_np = samples.detach().cpu().numpy()
-        x_batch_np = x_batch.detach().cpu().numpy()
-
-        print('crps')
-        print(crps_batch_per_marginal(samples_np, x_batch_np))
-        # print('energy score')
-        # print(energy_score_per_batch(samples_np, x_batch_np))
-        # print('variogram score')
-        # print(variogram_score_per_batch(samples_np, x_batch_np))
-        # quantile_score = quantile_score_averaged_fast(quantiles, x_batch_np)
-        # print("quantile_score")
-        # print(quantile_score)
-
-
-        # break
+flow = NSF(x_dim=24, c_dim=c_dim, hidden_features=[16, 16], transforms=3)
+history = flow.fit(train_dataloader, validation_dataloader=validation_dataloader, epochs=epochs, lr=lr, patience=20, device=device, save_path='models/NSF_MODEL_WIND.pt')
+plot_training(history, title='Learning curve (NSF)', save_path='plots/NSF_LEARNING_CURVE_WIND.png')
+evaluate_flow(flow, test_dataloader, 'NSF_WIND', save_path='evaluations/NF_EVALUATION.json')
+plot_forecasts(flow, prediction_loader, save_path='plots/NSF_FORECASTS_WIND.jpg')
