@@ -293,7 +293,7 @@ class GEFcomSolarLoader():
 
     def split(self, random_state=42, test_size=0.2, validation_size=0.2, shuffle=True):
         df_per_day = self.create_dataset(shuffle=shuffle)
-        X = df_per_day.drop(columns=['POWER'])
+        X = df_per_day.drop(columns=['POWER' + str(h) for h in self.active_hours])
         self.context_dim = len(X.columns)
         y = df_per_day[['POWER' + str(h) for h in self.active_hours]]
 
