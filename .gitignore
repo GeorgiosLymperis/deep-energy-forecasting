@@ -4,3 +4,5 @@
 *.png
 *.pt
 *.json
+*.pkl
+*.pth
