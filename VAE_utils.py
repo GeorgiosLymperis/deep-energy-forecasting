@@ -6,9 +6,6 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import matplotlib.pyplot as plt
-from evaluation.metrics import crps_batch_per_marginal, energy_score_per_batch, variogram_score_per_batch
-import json
-from tqdm import tqdm
 
 def ensure_batch_context(x, c):
     """
@@ -511,7 +508,7 @@ class VAElinear(nn.Module):
         return qv
 
 
-def plot_training(history, save_path=None, title='Learning curve'):
+def plot_vae_training(history, save_path=None, title='Learning curve'):
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(history['train_loss'], label='loss')
     ax.plot(history['train_recon'], label='recon')
@@ -524,68 +521,3 @@ def plot_training(history, save_path=None, title='Learning curve'):
         plt.savefig(save_path)
 
     return fig, ax
-
-def make_24h_forecast_with_bands(vae, context, samples=100):
-    vae.eval()
-    device = next(vae.parameters()).device
-
-    Q1, median, Q3 = [], [], []
-    context = context.to(device)
-
-    prediction_quantiles = vae.quantiles(context, q=[0.25, 0.50, 0.75], n=samples)
-    Q1 = prediction_quantiles[0,:,:]
-    median = prediction_quantiles[1,:,:]
-    Q3 = prediction_quantiles[2,:,:]
-
-    return Q1, median, Q3
-
-def vae_losses(vae, dataloader):
-    device = next(vae.parameters()).device
-    vae.eval()
-    losses = []
-
-    with torch.no_grad():
-        for x, y in dataloader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            c = x.reshape(x.size(0), -1)
-            loss = -vae.log_prob(y, c).mean()
-            losses.append(loss)
-
-    return np.array(losses)
-
-def evaluate_vae(vae, test_dataloader, model_label, save_path=None, **kwargs):
-    n_samples = kwargs.get('samples', 20)
-    device = kwargs.get('device', next(vae.parameters()).device)
-
-    vae.eval()
-    all_crps, all_energy, all_vario = [], [], []
-
-    with torch.no_grad():
-        pbar = tqdm(test_dataloader, desc=f"Evaluating", leave=False)
-        for x, label in pbar:
-            x = x.to(device)
-            label = label.to(device)
-
-            c_batch = x.reshape(x.size(0), -1)   # [B, c_dim]
-            x_batch = label                   # [B, x_dim]
-
-            y_samps = vae.sample(n_samples, c_batch)     # (S, B, D)
-            y_np = y_samps.detach().cpu().numpy()
-            x_np = x_batch.detach().cpu().numpy()
-
-            all_crps.append(crps_batch_per_marginal(y_np, x_np))
-            all_energy.append(energy_score_per_batch(y_np, x_np))
-            all_vario.append(variogram_score_per_batch(y_np, x_np))
-
-    results = {
-        'label': model_label,
-        'crps': float(np.mean(all_crps)),
-        'energy': float(np.mean(all_energy)),
-        'variogram': float(np.mean(all_vario)),
-    }
-
-    if save_path is not None:
-        with open(save_path, 'w') as f:
-            json.dump(results, f)
-    return results

@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from evaluation.metrics import crps_batch_per_marginal, energy_score_per_batch, variogram_score_per_batch
-import json
 from tqdm import tqdm
 
 def ensure_batch_context(x, c):
@@ -81,15 +79,6 @@ class Generator(nn.Module):
                 nn.init.normal_(m.weight.data, mean=mean, std=std)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
-    # @torch.no_grad()
-    # def sample(self, n, c):          # n scenarios for context c
-    #     device = next(self.parameters()).device
-    #     S = []
-    #     for _ in range(n):
-    #         z = torch.randn(1, self.z_dim, device=device)
-    #         S.append(self.forward(z, c).squeeze(0))
-    #     return torch.stack(S)
     
     @torch.no_grad()
     def sample(self, n, c):
@@ -112,14 +101,6 @@ class Generator(nn.Module):
         y = self.forward(z, c_rep)  # (S*B, y_dim)
         y = y.view(n, B, self.y_dim)
         return y
-
-
-    # @torch.no_grad()
-    # def quantiles(self, c, q=100, n=100):
-    #     y = self.sample(n, c)
-    #     y = y.detach().cpu().numpy()
-    #     qv = np.quantile(y, q, axis=0)
-    #     return qv
     
     @torch.no_grad()
     def quantiles(self, c, q=(0.25, 0.5, 0.75), n=100):
@@ -251,115 +232,6 @@ def gradient_penalty(discriminator, real_data, fake_data, c):
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty
 
-def train_wgan_gp(
-        generator, discriminator, trainloader, validationloader=None, g_lr=1e-4, d_lr=1e-4, 
-        gp_lambda=10, n_critic=5, epochs=20, save_path=None, patience=20
-        ):
-    g_optimizer = torch.optim.Adam(generator.parameters(), lr=g_lr, betas=(0.0, 0.9))
-    d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=d_lr, betas=(0.0, 0.9))
-
-    g_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(g_optimizer, mode='min', factor=0.5, patience=3)
-    d_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(d_optimizer, mode='min', factor=0.5, patience=3)
-
-    device = next(generator.parameters()).device
-    z_dim = generator.z_dim
-
-    best_val = float('inf')
-    best_state = None
-    bad_epochs = 0
-
-    history = {
-        "d_loss": [],
-        "g_loss": [],
-        "val_loss": []
-    }
-    for epoch in range(1, epochs+1):
-        # samples_0 = generator.sample(10000, torch.tensor([0.0]))
-        # samples_1 = generator.sample(10000, torch.tensor([1.0]))
-        # fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-        # axs[0].hist2d(*samples_0.T, bins=64, range=((-2, 2), (-2, 2)))
-        # axs[0].set_title('cond=0')
-        # axs[1].hist2d(*samples_1.T, bins=64, range=((-2, 2), (-2, 2)))
-        # axs[1].set_title('cond=1')
-        # plt.show()
-        pbar = tqdm(trainloader, desc=f"Epoch {epoch}/{epochs} [train]", leave=False)
-        for c_batch, y_real in pbar:
-            c_batch = c_batch.to(device)
-            y_real = y_real.to(device)
-            batch_size = y_real.size(0)
-            d_losses = []
-            # Train discriminator
-            for _ in range(n_critic):
-                discriminator.train()
-                z = torch.randn(batch_size, z_dim, device=device)
-                y_fake = generator.forward(z, c_batch).detach()
-
-                d_real = discriminator(y_real, c_batch)
-                d_fake = discriminator(y_fake, c_batch)
-
-                gp = gradient_penalty(discriminator, y_real, y_fake, c_batch)
-                d_loss = -(d_real.mean() - d_fake.mean()) + gp_lambda * gp
-
-                d_optimizer.zero_grad(set_to_none=True)
-                d_loss.backward()
-                d_optimizer.step()
-
-                d_losses.append(d_loss.detach().cpu().item())
-            d_loss = np.mean(d_losses)
-            history['d_loss'].append(d_loss)
-            # d_sched.step(d_loss)
-
-
-            # Train generator
-            generator.train()
-            z = torch.randn(batch_size, z_dim, device=device)
-            y_fake = generator(z, c_batch)
-            d_fake = discriminator(y_fake, c_batch)
-            g_loss = -d_fake.mean()
-
-            history['g_loss'].append(g_loss.detach().cpu().item())
-
-            g_optimizer.zero_grad(set_to_none=True)
-            g_loss.backward()
-            g_optimizer.step()
-            # g_sched.step(g_loss)
-
-            if validationloader is not None:
-                with torch.no_grad():
-                    generator.eval()
-                    discriminator.eval()
-                    val_losses = []
-                    for val_c, val_y in validationloader:
-                        val_c = val_c.to(device)
-                        val_y = val_y.to(device)
-                        val_batch_size = val_y.size(0)
-                        val_z = torch.randn(val_batch_size, z_dim, device=device)
-                        val_y_fake = generator(val_z, val_c)
-                        val_d_fake = discriminator(val_y_fake, val_c)
-                        val_losses.append(-val_d_fake.mean().detach().cpu().item())
-                    val_loss = np.mean(val_losses)
-                    history['val_loss'].append(val_loss)
-
-                if val_loss < best_val:
-                    best_val = val_loss
-                    best_state = (generator.state_dict(), discriminator.state_dict())
-                    bad_epochs = 0
-                else:
-                    bad_epochs += 1
-                    if bad_epochs >= patience:
-                        print(f"Early stopping at epoch {epoch}")
-                        generator.load_state_dict(best_state[0])
-                        discriminator.load_state_dict(best_state[1])
-                        break
-        tqdm.write(f"Epoch {epoch}/{epochs} [train] Disc. Loss: {np.mean(d_losses):.4f}, Gen. Loss: {g_loss:.4f}"
-                    f"Val. Loss: {np.mean(val_loss):.4f}" if validationloader is not None else 
-                    f"Epoch {epoch}/{epochs} [train] Disc. Loss: {np.mean(d_losses):.4f}, Gen. Loss: {g_loss:.4f}")
-                
-    if save_path is not None:
-        torch.save(generator.state_dict(), "gen_" + save_path)
-        torch.save(discriminator.state_dict(), "disc_" +  save_path)
-    return discriminator, generator, history
-
 def train_wgan_gp_(
     generator, discriminator, trainloader, validationloader=None,
     g_lr=1e-4, d_lr=1e-4, gp_lambda=10, n_critic=5, epochs=20,
@@ -488,7 +360,7 @@ def train_wgan_gp_(
 
     return discriminator, generator, history
 
-def plot_training(history, save_path=None, title='Learning losses'):
+def plot_gan_training(history, save_path=None, title='Learning losses'):
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(history['d_loss'], label='discriminator loss')
     ax.plot(history['g_loss'], label='generator loss')
@@ -500,81 +372,3 @@ def plot_training(history, save_path=None, title='Learning losses'):
         plt.savefig(save_path)
 
     return fig, ax
-
-def evaluate_gan(generator, testloader, model_label, save_path=None, **kwargs):
-    n_samples = kwargs.get('samples', 20)
-    device = kwargs.get('device', next(generator.parameters()).device)
-
-    generator.eval()
-    all_crps, all_energy, all_vario = [], [], []
-
-    with torch.no_grad():
-        pbar = tqdm(testloader, desc=f"Evaluating", leave=False)
-        for c, label in pbar:
-            c = c.to(device)
-            label = label.to(device)
-
-            c_batch = c.reshape(c.size(0), -1)   # [B, c_dim]
-            x_batch = label                   # [B, x_dim]
-
-            y_samps = generator.sample(n_samples, c_batch)     # (S, B, D)
-            y_np = y_samps.detach().cpu().numpy()
-            x_np = x_batch.detach().cpu().numpy()
-
-            all_crps.append(crps_batch_per_marginal(y_np, x_np))
-            all_energy.append(energy_score_per_batch(y_np, x_np))
-            all_vario.append(variogram_score_per_batch(y_np, x_np))
-
-    results = {
-        'label': model_label,
-        'crps': float(np.mean(all_crps)),
-        'energy': float(np.mean(all_energy)),
-        'variogram': float(np.mean(all_vario))
-    }
-
-    if save_path is not None:
-        with open(save_path, 'w') as f:
-            json.dump(results, f)
-    return results
-
-def make_24h_forecast_with_bands(generator, context, samples=100):
-    """
-    Makes a forecast for the next 24 hours
-
-    generator: Trained flow
-    context: tensor with context the weather conditions of the day [B, c_dim]
-             Context must be scaled
-    samples: the size of the samples generated by flow
-
-    Returns: (Q1, median, Q3) numpy arrays
-    """
-    generator.eval()
-    device = next(generator.parameters()).device
-
-    Q1, median, Q3 = [], [], []
-    context = context.to(device)
-
-    prediction_quantiles = generator.quantiles(context, [0.25, 0.50, 0.75], n=samples)
-    Q1 = prediction_quantiles[0,:,:]
-    median = prediction_quantiles[1,:,:]
-    Q3 = prediction_quantiles[2,:,:]
-
-    return Q1, median, Q3
-
-def generator_losses(generator, dataloader):
-    """
-    Generate losses for Diebold-Mariano test.
-    """
-    device = next(generator.parameters()).device
-    generator.eval()
-    losses = []
-
-    with torch.no_grad():
-        for x, y in dataloader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            c = x.reshape(x.size(0), -1)
-            loss = -generator.log_prob(y, c).mean()
-            losses.append(loss)
-
-    return np.array(losses)
