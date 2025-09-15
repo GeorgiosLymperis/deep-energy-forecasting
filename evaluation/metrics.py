@@ -1,7 +1,11 @@
 import numpy as np
-from scipy.stats import norm, t
+from scipy.stats import t
 from scipy.signal import correlate
 from sklearn.ensemble import ExtraTreesClassifier
+from itertools import combinations
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc
 
 def crps_per_marginal(scenarios: np.ndarray, y_true: np.ndarray):
     """
@@ -32,8 +36,7 @@ def crps_batch_per_marginal(scenarios: np.ndarray, y_true: np.ndarray, calculate
     crps_list = []
     for i in range(y_true.shape[0]):
         crps_list.append(crps_per_marginal(scenarios[:, i, :], y_true[i, :]))
-    crps = np.mean(crps_list, axis=0)
-    return np.mean(crps) if calculate_mean else crps
+    return crps_list
 
 def energy_score(scenarios: np.ndarray, y_true: np.ndarray):
     """
@@ -54,12 +57,12 @@ def energy_score_per_batch(scenarios: np.ndarray, y_true: np.ndarray):
     y_true: np.ndarray of shape (batch, T)
 
     Returns:
-        Energy score (float)
+        Energy score (List)
     """
     energy_score_list = []
     for i in range(y_true.shape[0]):
         energy_score_list.append(energy_score(scenarios[:, i, :], y_true[i, :]))
-    return np.mean(energy_score_list)
+    return energy_score_list
 
 def variogram_score(scenarios: np.ndarray, y_true: np.ndarray, gamma=0.5):
     """
@@ -83,13 +86,13 @@ def variogram_score_per_batch(scenarios: np.ndarray, y_true: np.ndarray, gamma=0
     y_true: (batch, T)
 
     Returns:
-        Mean variogram score over batch
+        List with variogram score over batch
     """
     scores = [
         variogram_score(scenarios[:, i, :], y_true[i, :], gamma)
         for i in range(y_true.shape[0])
     ]
-    return np.mean(scores)
+    return scores
 
 def quantile_score_per_marginal(quantiles: np.ndarray, y_true: np.ndarray, q: int = 50):
     """
@@ -102,7 +105,7 @@ def quantile_score_per_marginal(quantiles: np.ndarray, y_true: np.ndarray, q: in
     """
     assert quantiles.shape[0] == 99
     assert 1 <= q <= 99
-    diff = quantiles[q, :] - y_true
+    diff = quantiles[q-1, :] - y_true
     return np.where(diff > 0, (1-q/100) * diff, -(q/100) * diff)
 
 def quantile_score_per_batch(quantiles: np.ndarray, y_true: np.ndarray, q: int = 50):
@@ -116,9 +119,8 @@ def quantile_score_per_batch(quantiles: np.ndarray, y_true: np.ndarray, q: int =
     """
     quantile_score_q = []
     for i in range(y_true.shape[0]):
-        quantile_score_q.append(quantile_score_per_marginal(quantiles[:, i, :], y_true[i, :], q).mean())
-
-    return np.mean(quantile_score_q)
+        quantile_score_q.append(quantile_score_per_marginal(quantiles[:, i, :], y_true[i, :], q))
+    return quantile_score_q
 
 def quantile_score_averaged(quantiles: np.ndarray, y_true: np.ndarray):
     return np.mean([quantile_score_per_batch(quantiles, y_true, q) for q in range(1, 100)])
@@ -139,33 +141,92 @@ def quantile_score_averaged_fast(quantiles: np.ndarray, y_true: np.ndarray) -> f
     loss = np.where(diff >= 0, (1 - qs) * diff, -qs * diff)
     return loss.mean()
 
-def diebold_mariano_test(loss_model_g, loss_model_h, h=1):
-    d = loss_model_g - loss_model_h
-    T = len(d)
-    d_mean = np.mean(d)
+def diebold_mariano_test(errors_g, errors_h, h=1, eps=1e-12):
+    """
+    errors_g, errors_h:
+        per-instance error arrays. Shapes allowed:
+        - (T,)  -> already scalar per instance (e.g., CRPS)
+        - (T, H) -> vectors per instance (e.g., 24-hour horizon); we use L1 across H
+    h:
+        Newey–West truncation lag (often set to forecast horizon - 1)
+    """
+    eg = np.asarray(errors_g)
+    eh = np.asarray(errors_h)
+
+    # Reduce to scalar loss per instance using L1 (sum of abs) if needed
+    if eg.ndim > 1:
+        lg = np.sum(np.abs(eg), axis=1)
+    else:
+        lg = np.abs(eg)
+
+    if eh.ndim > 1:
+        lh = np.sum(np.abs(eh), axis=1)
+    else:
+        lh = np.abs(eh)
+
+    # Loss differential series Δ_d
+    d = (lg - lh).ravel()
+    Tn = d.size
+
+    d_mean = d.mean()
     d_centered = d - d_mean
 
-    autocov = correlate(d_centered, d_centered, mode='full', method='fft') / T
-    mid = len(autocov) // 2
-    gamma = autocov[mid - h: mid + h + 1]  # lags from -h to +h
+    # Autocovariances (Newey–West up to lag h)
+    ac = correlate(d_centered, d_centered, mode='full', method='fft') / Tn
+    mid = ac.size // 2
+    gamma = ac[mid - h: mid + h + 1]  # lags -h..+h
 
-    # Long-run variance estimator (Newey-West with truncation lag h)
-    f_d = gamma[0] + 2 * np.sum(gamma[1:])  # sum of autocovariances
+    f_d = gamma[0] + 2 * gamma[1:].sum()
+    f_d = max(f_d, eps)
 
-    DM_stat = d_mean / np.sqrt(f_d / T)
+    DM_stat = d_mean / np.sqrt(f_d / Tn)
 
     # Harvey et al. (1997) small-sample correction
-    correction_factor = np.sqrt((T + 1 - 2 * h + h * (h - 1)/T) / T)
-    DM_corrected = DM_stat * correction_factor
+    corr = np.sqrt((Tn + 1 - 2*h + h*(h - 1)/Tn) / Tn)
+    DM_corr = DM_stat * corr
 
-    # Two-sided p-value
-    p_value = 2 * t.cdf(-np.abs(DM_corrected), df=T - 1)
+    # Two-sided p-value (scalar)
+    p_value = float(2 * t.cdf(-abs(DM_corr), df=Tn - 1))
+    return float(DM_corr), p_value
 
-    return DM_corrected, p_value
+
+def dm_pvalue_matrix(loss_dict, labels, h=1):
+    """
+    loss_dict: {"NF": np.array([...]), "VAE": ..., ...} for ONE metric.
+    labels: ["NF", "VAE", ...]
+    returns: DataFrame of p-values (NxN)
+    """
+    n = len(labels)
+    p_values = np.full((n, n), np.nan)
+
+    for m1, m2 in combinations(labels, 2):
+        _, pval = diebold_mariano_test(loss_dict[m1], loss_dict[m2], h=h)
+        i, j = labels.index(m1), labels.index(m2)
+        p_values[i, j] = pval
+        p_values[j, i] = pval
+
+    return pd.DataFrame(p_values, index=labels, columns=labels)
 
 def fit_trees(X, y, **kwargs):
-    max_depth = kwargs.get('max_depth', 10)
-    n_estiamtors = kwargs.get('n_estimators', 100)
-    clf = ExtraTreesClassifier(max_depth=max_depth, n_estimators=n_estiamtors, n_jobs=-1, random_state=42)
+    params = {
+        "n_estimators": kwargs.get("n_estimators", 300),
+        "max_depth":    kwargs.get("max_depth", None),
+        "min_samples_leaf": kwargs.get("min_samples_leaf", 1),
+        "n_jobs":       kwargs.get("n_jobs", -1),
+        "random_state": kwargs.get("random_state", 42),
+        "class_weight": kwargs.get("class_weight", None),
+    }
+    clf = ExtraTreesClassifier(**params)
     clf.fit(X, y)
     return clf
+
+def roc_for_real_vs_fake(X_real, X_fake, test_size=0.3, random_state=42, **tree_kwargs):
+    X = np.vstack([X_real, X_fake])
+    y = np.r_[np.ones(len(X_real), dtype=int), np.zeros(len(X_fake), dtype=int)]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=random_state
+    )
+    clf = fit_trees(X_train, y_train, **tree_kwargs)
+    y_score = clf.predict_proba(X_test)[:, 1]
+    fpr, tpr, _ = roc_curve(y_test, y_score)
+    return fpr, tpr, auc(fpr, tpr)
