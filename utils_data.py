@@ -50,6 +50,7 @@ def create_load_dataset(folder='data/load', save=False):
         df_load = pd.concat([df_load, df], axis=0)
     df_load = df_load.drop(columns=['ZONEID']) # It has only one zone, so drop it
     df_load = df_load.drop_duplicates()
+    df_load = df_load.dropna()
     if save:
         df_load.to_csv('data/load_data.csv')
     return df_load
@@ -381,7 +382,7 @@ class GEFcomLoadLoader():
         self.y_scaler = y_scaler
 
     def __build_features(self):
-        self.dataframe = self.dataframe.bfill()
+        self.dataframe = self.dataframe.dropna()
         self.features = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8', 'w9', 'w10',
                 'w11', 'w12', 'w13', 'w14', 'w15', 'w16', 'w17', 'w18', 'w19', 'w20',
                 'w21', 'w22', 'w23', 'w24', 'w25']
