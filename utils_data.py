@@ -49,8 +49,9 @@ def create_load_dataset(folder='data/load', save=False):
         df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], format='%m%d%Y %H:%M')
         df_load = pd.concat([df_load, df], axis=0)
     df_load = df_load.drop(columns=['ZONEID']) # It has only one zone, so drop it
-    df_load = df_load.drop_duplicates()
+    df_load = df_load.drop_duplicates(subset=['TIMESTAMP'])
     df_load = df_load.dropna()
+    df_load = df_load.sort_values(by='TIMESTAMP').iloc[23:]
     if save:
         df_load.to_csv('data/load_data.csv')
     return df_load
