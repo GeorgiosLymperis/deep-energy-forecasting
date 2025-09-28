@@ -6,3 +6,4 @@
 *.json
 *.pkl
 *.pth
+*.db
