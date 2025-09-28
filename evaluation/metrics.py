@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.stats import t
+from scipy.stats import t, norm
 from scipy.signal import correlate
 from sklearn.ensemble import ExtraTreesClassifier
 from itertools import combinations
@@ -169,6 +169,13 @@ def diebold_mariano_test(errors_g, errors_h, h=1, eps=1e-12):
     Tn = d.size
 
     d_mean = d.mean()
+    # d_var = np.var(d, ddof=1)
+    # DM_stat = d_mean / np.sqrt(d_var / Tn)
+
+    # p_value = 1 - norm.cdf(DM_stat)
+
+    # return float(DM_stat), p_value
+
     d_centered = d - d_mean
 
     # Autocovariances (Newey–West up to lag h)

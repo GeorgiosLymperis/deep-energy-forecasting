@@ -37,7 +37,7 @@ def make_24h_forecast_with_bands(model, context, samples=100):
 def plot_wind_forecasts(model, prediction_loader, save_path=None, **kwargs):
     device = next(model.parameters()).device
     model.eval()
-    dataset = prediction_loader.create_dataset(shuffle=False)
+    dataset = prediction_loader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
     target_names = ['TARGETVAR' + str(h) for h in range(1, 25)]
     zones = ['ZONE_' + str(i) for i in range(1, 10 + 1)]
     samples = kwargs.get('samples', 100)
@@ -66,15 +66,41 @@ def plot_wind_forecasts(model, prediction_loader, save_path=None, **kwargs):
         axe.set_ylim(0, 1)
         axe.legend()
         axe.set_ylabel('Power')
+        axe.set_xlabel('Day')
 
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path)
 
+def compare_models_on_wind_forecasts(prediction_loader, models: List, save_path=None, **kwargs):
+    device = next(models[0].parameters()).device
+    for model in models:
+        model.eval()
+    dataset = prediction_loader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
+    random_day = dataset.sample(n=1)
+    target_names = ['TARGETVAR' + str(h) for h in range(1, 25)]
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12,14))
+    ax.plot(np.arange(1, 25), random_day[target_names].values.reshape(-1), label='Target')
+    samples = kwargs.get('samples', 100)
+    context = random_day.drop(columns=target_names)
+    context_scaled = prediction_loader.x_scaler.transform(context)
+    c = torch.from_numpy(context_scaled).to(torch.float)
+    c = c.to(device)
+    for model in models:
+        _, median, _ = make_24h_forecast_with_bands(model, c, samples=samples)
+        median = prediction_loader.y_scaler.inverse_transform(median)
+        ax.plot(np.arange(1, 25), median.reshape(-1), label=model.__class__.__name__)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel('Power')
+    ax.set_xlabel('Hour')
+    ax.legend()
+    if save_path is not None:
+        fig.savefig(save_path)
+    
 def plot_solar_forecasts(model, prediction_loader, save_path=None, **kwargs):
     device = next(model.parameters()).device
     model.eval()
-    dataset = prediction_loader.create_dataset(shuffle=False)
+    dataset = prediction_loader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
     active_hours = prediction_loader.active_hours
     target_names = ['POWER' + str(h) for h in active_hours]
     zones = ['ZONE_' + str(i) for i in range(1, 3 + 1)]
@@ -97,22 +123,49 @@ def plot_solar_forecasts(model, prediction_loader, save_path=None, **kwargs):
         Q3 = prediction_loader.y_scaler.inverse_transform(Q3).reshape(-1)
 
         mae = mean_absolute_error(targets, median)
-        axe.fill_between(np.arange(len(targets))/24, Q1, Q3, alpha=0.2)
-        axe.plot(np.arange(len(targets))/24, median, label='median')
-        axe.plot(np.arange(len(targets))/24, targets, label='targets')
+        axe.fill_between(np.arange(len(targets))/len(active_hours), Q1, Q3, alpha=0.2)
+        axe.plot(np.arange(len(targets))/len(active_hours), median, label='median')
+        axe.plot(np.arange(len(targets))/len(active_hours), targets, label='targets')
         axe.set_title(f"{zone} (MAE={mae:.2f})")
         axe.legend()
         axe.set_ylabel('Power')
+        axe.set_xlabel('Day')
 
 
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path)
 
+def compare_models_on_solar_forecasts(prediction_loader, models: List, save_path=None, **kwargs):
+    device = next(models[0].parameters()).device
+    for model in models:
+        model.eval()
+    dataset = prediction_loader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
+    random_day = dataset.sample(n=1)
+    active_hours = prediction_loader.active_hours
+    target_names = ['POWER' + str(h) for h in active_hours]
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12,14))
+    ax.plot(np.arange(1, len(active_hours) + 1), random_day[target_names].values.reshape(-1), label='Target')
+    samples = kwargs.get('samples', 100)
+    context = random_day.drop(columns=target_names)
+    context_scaled = prediction_loader.x_scaler.transform(context)
+    c = torch.from_numpy(context_scaled).to(torch.float)
+    c = c.to(device)
+    for model in models:
+        _, median, _ = make_24h_forecast_with_bands(model, c, samples=samples)
+        median = prediction_loader.y_scaler.inverse_transform(median)
+        ax.plot(np.arange(1, len(active_hours) + 1), median.reshape(-1), label=model.__class__.__name__)
+    ax.set_ylabel('Power')
+    ax.set_xlabel('Hour')
+    ax.legend()
+    if save_path is not None:
+        fig.savefig(save_path)
+
+
 def plot_load_forecasts(model, prediction_dataloader, save_path=None, **kwargs):
     device = next(model.parameters()).device
     model.eval()
-    dataset = prediction_dataloader.create_dataset(shuffle=False)
+    dataset = prediction_dataloader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
     target_names = ['LOAD' + str(h) for h in range(1, 25)]
     samples = kwargs.get('samples', 100)
     
@@ -135,12 +188,38 @@ def plot_load_forecasts(model, prediction_dataloader, save_path=None, **kwargs):
     axes.set_title(f"(MAE={mae:.2f})")
     axes.legend()
     axes.set_ylabel('Power')
+    axes.set_xlabel('Day')
+
     fig.tight_layout()
 
     if save_path is not None:
         plt.savefig(save_path)
 
     return fig, axes
+
+def compare_models_on_load_forecasts(prediction_loader, models: List, save_path=None, **kwargs):
+    device = next(models[0].parameters()).device
+    for model in models:
+        model.eval()
+    dataset = prediction_loader.create_dataset(shuffle=False, filter_hours=kwargs.get('filter_hours', []))
+    random_day = dataset.sample(n=1)
+    target_names = ['LOAD' + str(h) for h in range(1, 25)]
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(12,14))
+    ax.plot(np.arange(1, 25), random_day[target_names].values.reshape(-1), label='Target')
+    samples = kwargs.get('samples', 100)
+    context = random_day.drop(columns=target_names)
+    context_scaled = prediction_loader.x_scaler.transform(context)
+    c = torch.from_numpy(context_scaled).to(torch.float)
+    c = c.to(device)
+    for model in models:
+        _, median, _ = make_24h_forecast_with_bands(model, c, samples=samples)
+        median = prediction_loader.y_scaler.inverse_transform(median)
+        ax.plot(np.arange(1, 25), median.reshape(-1), label=model.__class__.__name__)
+    ax.set_ylabel('Power')
+    ax.set_xlabel('Hour')
+    ax.legend()
+    if save_path is not None:
+        fig.savefig(save_path)
 
 def plot_correlations(model, context, scaler, save_path: str=None, title: str = 'Correlations'):
     device = next(model.parameters()).device
@@ -247,7 +326,7 @@ def plot_crps(crps: List[np.ndarray], labels: List[str], save_path: str =None, t
     ax.set_xlabel('Hour')
     ax.set_ylabel('Score')
     ax.set_title(title)
-    ax.set_xlim(1, 24)
+    ax.set_xlim(1, len(c)+1)
     ax.legend()
 
     if save_path is not None:
@@ -336,7 +415,7 @@ def plot_roc_many_scenarios(real_feats, fake_feats_by_model, n_runs=50,
             fpr, tpr, _ = roc_for_real_vs_fake(real_feats, runs[i], 
                                                n_estimators=300, max_depth=None)
             label = model_name if i == 0 else None
-            plt.plot(fpr, tpr, lw=1, alpha=0.25, color=color, label=label)
+            plt.plot(fpr, tpr, lw=1, alpha=1, color=color, label=label)
 
     plt.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.6)
     plt.legend()
@@ -349,5 +428,3 @@ def plot_roc_many_scenarios(real_feats, fake_feats_by_model, n_runs=50,
 
     if save_path is not None:
         plt.savefig(save_path)
-
-    return plt
