@@ -3,12 +3,12 @@ from functools import partial
 import torch
 import optuna
 from optuna.pruners import SuccessiveHalvingPruner
-from optuna.samplers import TPESampler
+from optuna.samplers import TPESampler, RandomSampler
 
-from ..gans_utils import gan_objective
-from ..VAE_utils import vae_objective
-from ..nf_utils import naf_objective, nsf_objective
-from ..utils_data import GEFcomWindLoader, create_wind_dataset
+from models.wgan import gan_objective
+from models.vae import vae_objective
+from models.nf import naf_objective, nsf_objective
+from data.utils_data import GEFcomWindLoader, create_wind_dataset
 
 import warnings
 warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
@@ -33,28 +33,39 @@ train_dataloader, validation_dataloader, test_dataloader = train_loader.get_data
 c_dim = train_loader.context_dim
 x_dim = 24
 
-OBJ_EPOCHS = 15
-N_TRIALS = 25
-
-pruner = SuccessiveHalvingPruner(min_resource=5, reduction_factor=3)
+OBJ_EPOCHS = 10
+pruner = SuccessiveHalvingPruner(min_resource=11, reduction_factor=3)
 
 # ---- Helper functions ----
 SEED = 1
-def new_sampler():
-    return TPESampler(multivariate=True, group=True, seed=SEED)
+def new_sampler(sampler='random'):
+    ''''
+    sampler: 'random'(default) or 'tpe'
+    returns sampler
+    raise NotImplementedError
+    '''
+    if sampler == 'random':
+        return RandomSampler(seed=SEED)
+    elif sampler == 'tpe':
+        return TPESampler(multivariate=True, group=True, seed=SEED)
+    else:
+        raise NotImplementedError(f"Sampler {sampler} not implemented")
 
 def make_study(db_name, study_name, sampler):
     return optuna.create_study(
         direction="minimize",
         sampler=sampler,
         pruner=pruner,
-        storage=f"sqlite:///{db_name}",
+        storage=f"sqlite:///tuning/{db_name}",
         load_if_exists=True,
         study_name=study_name,
     )
 
-def log_callback(study, trial):
-    print(f"[{study.study_name}] trial#{trial.number} value={trial.value} params={trial.params}")
+def make_and_run_study(db_name, study_name, objective, random_n=25, tpe_n=25):
+    study = make_study(db_name, study_name, new_sampler("random"))
+    study.optimize(objective, n_trials=random_n)
+    study.sampler = new_sampler("tpe")
+    study.optimize(objective, n_trials=tpe_n)
 
 #  ---- Objectives ----
 gan_objective_ = partial(
@@ -88,16 +99,10 @@ nsf_objective_ = partial(
 )
 
 # ---- Studies ----
-gan_study = make_study("gan_study.db", "wind", new_sampler())
-gan_study.optimize(gan_objective_, n_trials=N_TRIALS, callbacks=[log_callback])
+make_and_run_study("gan_study.db", "wind", gan_objective_, random_n=25, tpe_n=25)
 
-vae_study = make_study("vae_study.db", "wind", new_sampler())
-vae_study.optimize(vae_objective_, n_trials=N_TRIALS, callbacks=[log_callback])
+make_and_run_study("vae_study.db", "wind", vae_objective_, random_n=25, tpe_n=25)
 
-# NAF and NSF are slower
-N_TRIALS = 10
-naf_study = make_study("naf_study.db", "wind", new_sampler())
-naf_study.optimize(naf_objective_, n_trials=N_TRIALS, callbacks=[log_callback])
+make_and_run_study("naf_study.db", "wind", naf_objective_, random_n=10, tpe_n=10)
 
-nsf_study = make_study("nsf_study.db", "wind", new_sampler())
-nsf_study.optimize(nsf_objective_, n_trials=N_TRIALS, callbacks=[log_callback])
+make_and_run_study("nsf_study.db", "wind", nsf_objective_, random_n=10, tpe_n=15)

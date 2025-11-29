@@ -1,4 +1,6 @@
-*.csv
+data/load
+data/solar
+data/wind
 *.pyc
 *.jpg
 *.png
@@ -7,3 +9,6 @@
 *.pkl
 *.pth
 *.db
+*.ini
+*.log
+*.txt
